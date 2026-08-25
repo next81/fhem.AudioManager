@@ -1,0 +1,1058 @@
+use strict;
+use warnings;
+use Test2::V0;
+use Time::Local qw(timelocal);
+use lib 'lib', 'tests/lib';
+use AudioManagerTestEnv qw(reset_env add_sonos add_bridge add_tts define_manager command_log log_messages timers run_next_timer advance_time reading_value set_reading);
+
+my $loaded = do './FHEM/90_AudioManager.pm';
+die $@ if $@;
+die $! if !defined $loaded;
+
+subtest 'Initialize, Define und Bridge-Abgrenzung' => sub {
+	reset_env();
+	my $module = $main::modules{AudioManager};
+	is($module->{DefFn}, 'AudioManager_Define', 'DefFn ist registriert');
+	is($module->{SetFn}, 'AudioManager_Set', 'SetFn ist registriert');
+	is($module->{GetFn}, 'AudioManager_Get', 'GetFn ist registriert');
+	like($module->{AttrList}, qr/speakDedupeWindow/, 'Deduplizierungsattribut ist registriert');
+	like($module->{AttrList}, qr/quietHours/, 'Ruhezeitenattribut ist registriert');
+	like($module->{AttrList}, qr/volumeLimits/, 'Lautstaerkebegrenzungen sind registriert');
+	like($module->{AttrList}, qr/autoLeave:0,1/, 'autoLeave ist als boolesches Attribut registriert');
+	like($module->{AttrList}, qr/healthDebounce/, 'Health-Debounce ist als Attribut registriert');
+	like($module->{AttrList}, qr/healthVerifyTimeout/, 'Health-Bestaetigungsfrist ist als Attribut registriert');
+	like($module->{AttrList}, qr/healthProbeInterval/, 'Health-Probeintervall ist als Attribut registriert');
+	like($module->{AttrList}, qr/backendAvailability/, 'optionale Backend-Availability ist als Attribut registriert');
+	add_sonos('Sonos.A', 'uuid-a');
+	my ($hash, $error) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	is($error, undef, 'Manager wird ohne Bridge definiert');
+	is($hash->{NOTIFYDEV}, 'Sonos.A,global', 'Notify beobachtet nur Player und Lifecycle');
+	is(reading_value('Audio', 'playerCount'), 1, 'Playergrenze ist sichtbar');
+	is($hash->{helper}{backends}{sonos2mqtt}{auto_leave}, 0, 'autoLeave ist standardmaessig deaktiviert');
+	add_bridge('Sonos.Bridge', 'sonos', 2);
+	my $global = { NAME => 'global', CHANGED => ['INITIALIZED'] };
+	main::AudioManager_Notify($hash, $global);
+	is($hash->{NOTIFYDEV}, 'Sonos.A,Sonos.Bridge,global', 'Lifecycle erkennt eine spaeter geladene Bridgezuordnung');
+	my (undef, $bridge_error) = define_manager('Bad', 'sonos2mqtt=Sonos.Bridge');
+	like($bridge_error, qr/kein sonos2mqtt_speaker/, 'Bridge kann nicht als Player definiert werden');
+};
+
+subtest 'Attributparser akzeptieren partielle Defaults und lehnen Fehler ab' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	my ($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	is(main::AudioManager_Attr('set', 'Audio', 'priorities', 'alarm:500,speak:350'), undef, 'partielle Prioritaeten sind gueltig');
+	like(main::AudioManager_Attr('set', 'Audio', 'priorities', 'unknown:1'), qr/Unbekannte|Ungueltiger/, 'unbekannte Audioart wird abgelehnt');
+	is(main::AudioManager_Attr('set', 'Audio', 'speakDedupeWindow', '2.5'), undef, 'Dezimalfenster ist gueltig');
+	is(main::AudioManager_Attr('set', 'Audio', 'autoLeave', '1'), undef, 'autoLeave kann aktiviert werden');
+	is($hash->{helper}{backends}{sonos2mqtt}{auto_leave}, 1, 'Adapter erhaelt autoLeave sofort');
+	like(main::AudioManager_Attr('set', 'Audio', 'autoLeave', '2'), qr/0 oder 1/, 'ungueltiges autoLeave wird abgelehnt');
+	is(main::AudioManager_Attr('del', 'Audio', 'autoLeave'), undef, 'Loeschen stellt den Default wieder her');
+	is($hash->{helper}{backends}{sonos2mqtt}{auto_leave}, 0, 'Adapter verwendet nach Loeschen wieder Default 0');
+	like(main::AudioManager_Attr('set', 'Audio', 'defaultVolumes', 'alarm:101'), qr/zwischen 0 und 100/, 'zu hohe Lautstaerke wird abgelehnt');
+	is(
+		main::AudioManager_Attr('set', 'Audio', 'volumeLimits', 'stream:10-40,alarm:8-20:30-80,20-8:30-50'),
+		undef,
+		'statische und zeitabhaengige Lautstaerkebegrenzungen sind gueltig',
+	);
+	is(main::AudioManager_Attr('set', 'Audio', 'healthDebounce', '0'), undef, 'Health-Debounce darf deaktiviert werden');
+	like(main::AudioManager_Attr('set', 'Audio', 'healthDebounce', '-1'), qr/nichtnegative/, 'negativer Health-Debounce wird abgelehnt');
+	like(main::AudioManager_Attr('set', 'Audio', 'healthVerifyTimeout', '0'), qr/positive/, 'Bestaetigungsfrist muss positiv bleiben');
+	is(main::AudioManager_Attr('set', 'Audio', 'healthRecoveryCooldown', '30.5'), undef, 'Recovery-Cooldown akzeptiert Sekundenbruchteile');
+	is(main::AudioManager_Attr('set', 'Audio', 'healthProbeInterval', '30.5'), undef, 'Probeintervall akzeptiert Sekundenbruchteile');
+	like(main::AudioManager_Attr('set', 'Audio', 'healthProbeInterval', '0'), qr/positive/, 'Probeintervall muss positiv bleiben');
+	my ($availability, $availability_error) = main::AudioManager_parse_backend_availability(
+		'sonos=Sonos.Bridge,music=Music.Bridge:serviceState',
+	);
+	is($availability_error, undef, 'mehrere Praefixe sind gueltig');
+	is($availability->{sonos}{reading}, 'connected', 'ohne Reading gilt connected als Default');
+	is($availability->{music}{reading}, 'serviceState', 'abweichendes Reading bleibt erhalten');
+	like(
+		main::AudioManager_Attr('set', 'Audio', 'backendAvailability', 'sonos=Bridge:bad:extra'),
+		qr/Ungueltige/,
+		'ungueltige Availability-Zuordnung wird abgelehnt',
+	);
+	is(main::AudioManager_Attr('set', 'Audio', 'zones', 'EG=Sonos.A'), undef, 'verwaltete Zone ist gueltig');
+	like(main::AudioManager_Attr('set', 'Audio', 'zones', 'EG=Sonos.Fremd'), qr/nicht verwalteten/, 'fremder Zonenplayer wird abgelehnt');
+	$main::attr{Audio}{priorities} = 'alarm:500,speak:350';
+	is(main::AudioManager_Get($hash, 'Audio', 'priorities'), '{"alarm":500,"play":200,"queue":100,"speak":350,"stream":50}', 'wirksame Prioritaeten sind abrufbar');
+};
+
+
+subtest 'volumeLimits klemmt Requests und Alarmminimum zeitabhaengig' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	my ($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	my ($limits, $parse_error) = main::AudioManager_parse_volume_limits(
+		'stream:10-40,alarm:8-20:30-80,20-8:30-50',
+	);
+	is($parse_error, undef, 'statische Grenze und zwei Alarmfenster werden geparst');
+	is(
+		main::AudioManager_volume_limit_at($limits, 'stream', 3 * 60),
+		{ minimum => 10, maximum => 40, all_day => 1 },
+		'statische Streamgrenze gilt ganztags',
+	);
+	is(
+		main::AudioManager_volume_limit_at($limits, 'alarm', 19 * 60 + 59),
+		{ minimum => 30, maximum => 80, all_day => 0, start => 8 * 60, end => 20 * 60 },
+		'Tagesfenster gilt bis zum exklusiven Ende',
+	);
+	is(
+		main::AudioManager_volume_limit_at($limits, 'alarm', 21 * 60),
+		{ minimum => 30, maximum => 50, all_day => 0, start => 20 * 60, end => 8 * 60 },
+		'Nachtfenster reicht ueber Mitternacht',
+	);
+	like(
+		main::AudioManager_Attr('set', 'Audio', 'volumeLimits', 'alarm:20-8:30-50,7-21:40-60'),
+		qr/ueberlappen/,
+		'ueberlappende Zeitfenster werden abgelehnt',
+	);
+	like(
+		main::AudioManager_Attr('set', 'Audio', 'volumeLimits', 'stream:50-40'),
+		qr/Minimum groesser/,
+		'vertauschte Pegelgrenzen werden abgelehnt',
+	);
+
+	$main::attr{Audio}{volumeLimits} = 'stream:10-40';
+	is(
+		main::AudioManager_Set($hash, 'Audio', 'stream', 'volume=90', 'Antenne.Muenster'),
+		undef,
+		'Stream oberhalb der Grenze wird angenommen und geklemmt',
+	);
+	ok(grep($_ eq 'set Sonos.A volume 40', @{ command_log() }), 'Stream startet hoechstens mit Lautstaerke 40');
+
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a', undef, volume => 90);
+	($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	$main::attr{Audio}{volumeLimits} = 'alarm:8-20:30-80,20-8:30-50';
+	$AudioManagerTestEnv::NOW = timelocal(0, 0, 21, 15, 0, 127);
+	is(
+		main::AudioManager_Set($hash, 'Audio', 'alarm', 'volume=80', 'https://fhem/alarm.mp3'),
+		undef,
+		'Alarmminimum oberhalb der Nachtgrenze wird sicher abgesenkt',
+	);
+	ok(grep($_ eq 'set Sonos.A volume 50', @{ command_log() }), 'Nachtalarm bleibt trotz lautem Player bei hoechstens 50');
+	my (undef, $volume_error) = main::AudioManager_Submit('Audio', 'play', {
+		uri => 'https://fhem/gong.mp3', volume => 101,
+	});
+	like($volume_error, qr/volume muss zwischen/, 'direkte API lehnt ungueltige Lautstaerke ebenfalls ab');
+};
+
+
+subtest 'quietHours parst mehrere Fenster und blockiert nur konfigurierte Audioarten' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	add_tts('SonosTTS');
+	$main::attr{Audio}{ttsDevice} = 'SonosTTS';
+	my ($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	my ($quiet_hours, $parse_error) = main::AudioManager_parse_quiet_hours('speak=20-7,12-14,queue=10-12');
+	is($parse_error, undef, 'Nacht- und Mittagsfenster sind gueltig');
+	ok(main::AudioManager_quiet_hours_match($quiet_hours, 'speak', 20 * 60), 'Start der Nachtruhe ist gesperrt');
+	ok(main::AudioManager_quiet_hours_match($quiet_hours, 'speak', 6 * 60 + 59), 'Minute vor Ende der Nachtruhe ist gesperrt');
+	ok(!main::AudioManager_quiet_hours_match($quiet_hours, 'speak', 7 * 60), 'Ende der Nachtruhe ist wieder freigegeben');
+	ok(main::AudioManager_quiet_hours_match($quiet_hours, 'speak', 12 * 60), 'Start der Mittagsruhe ist gesperrt');
+	ok(!main::AudioManager_quiet_hours_match($quiet_hours, 'speak', 14 * 60), 'Ende der Mittagsruhe ist wieder freigegeben');
+	ok(main::AudioManager_quiet_hours_match($quiet_hours, 'queue', 10 * 60), 'zweite Audioart wird mit Komma begonnen');
+	ok(!main::AudioManager_quiet_hours_match($quiet_hours, 'queue', 12 * 60), 'Ende der Queue-Ruhe ist wieder freigegeben');
+	ok(!main::AudioManager_quiet_hours_match($quiet_hours, 'alarm', 21 * 60), 'nicht konfigurierter Alarm bleibt freigegeben');
+	like(main::AudioManager_Attr('set', 'Audio', 'quietHours', 'speak=25-7'), qr/Ungueltiges Ruhefenster/, 'ungueltige Stunde wird abgelehnt');
+	like(main::AudioManager_Attr('set', 'Audio', 'quietHours', 'unknown=20-7'), qr/Ungueltiger Ruhezeiteneintrag/, 'unbekannte Audioart wird abgelehnt');
+	like(main::AudioManager_Attr('set', 'Audio', 'quietHours', 'speak=7-7'), qr/keine Dauer/, 'leeres Zeitfenster wird abgelehnt');
+	is(main::AudioManager_Attr('set', 'Audio', 'quietHours', 'speak=20-7,12-14,queue=10-12'), undef, 'Attributvalidierung akzeptiert mehrere Fenster und Audioarten');
+	$main::attr{Audio}{quietHours} = 'speak=20-7,12-14';
+	$AudioManagerTestEnv::NOW = timelocal(0, 0, 21, 15, 0, 127);
+	like(
+		main::AudioManager_Set($hash, 'Audio', 'speak', 'Leise Meldung'),
+		qr/quietHours/,
+		'normale Sprache wird in der Nachtruhe abgelehnt',
+	);
+	ok(!grep($_ eq 'set SonosTTS tts Leise Meldung', @{ command_log() }), 'blockierte Sprache startet keine TTS-Erzeugung');
+	is(main::AudioManager_Set($hash, 'Audio', 'alarm', 'text=Dringender', 'Alarm'), undef, 'Alarm bleibt in der Nachtruhe erlaubt');
+	ok(grep($_ eq 'set SonosTTS tts Dringender Alarm', @{ command_log() }), 'Alarmtext startet weiterhin die TTS-Erzeugung');
+};
+
+subtest 'Alarm erkennt URLs automatisch und erlaubt explizite Inhaltsarten' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	add_tts('SonosTTS');
+	$main::attr{Audio}{ttsDevice} = 'SonosTTS';
+	my ($hash, $error) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	is($error, undef, 'Manager fuer Alarmtests wird definiert');
+	is(
+		main::AudioManager_Set($hash, 'Audio', 'alarm', 'target=group:Sonos.A', 'volume=50',
+			'Dies', 'ist', 'ein', 'AudioManager-Test.'),
+		undef,
+		'Alarm ohne Modus behandelt normalen Inhalt als Text',
+	);
+	ok(
+		grep($_ eq 'set SonosTTS tts Dies ist ein AudioManager-Test.', @{ command_log() }),
+		'erkannter Alarmtext startet TTS',
+	);
+
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	add_tts('SonosTTS');
+	$main::attr{Audio}{ttsDevice} = 'SonosTTS';
+	($hash, $error) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	is(
+		main::AudioManager_Set($hash, 'Audio', 'alarm', 'https://fhem/alarm.mp3'),
+		undef,
+		'URL ohne Modus wird als URI angenommen',
+	);
+	ok(
+		grep($_ eq 'set Sonos.A playUri https://fhem/alarm.mp3', @{ command_log() }),
+		'erkannte URL wird direkt abgespielt',
+	);
+	ok(!grep(/^set SonosTTS tts /, @{ command_log() }), 'URL startet keine TTS-Erzeugung');
+
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	add_tts('SonosTTS');
+	$main::attr{Audio}{ttsDevice} = 'SonosTTS';
+	($hash, $error) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	is(
+		main::AudioManager_Set($hash, 'Audio', 'alarm', 'text=https://fhem/alarm.mp3'),
+		undef,
+		'explizites text= uebersteuert die URL-Erkennung',
+	);
+	ok(
+		grep($_ eq 'set SonosTTS tts https://fhem/alarm.mp3', @{ command_log() }),
+		'eine ausdruecklich als Text markierte URL wird vorgelesen',
+	);
+
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	($hash, $error) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	is(
+		main::AudioManager_Set($hash, 'Audio', 'alarm', 'uri=alarm.mp3'),
+		undef,
+		'explizites uri= erlaubt auch nicht URL-foermige Quellen',
+	);
+	ok(
+		grep($_ eq 'set Sonos.A playUri alarm.mp3', @{ command_log() }),
+		'explizite URI wird direkt abgespielt',
+	);
+};
+
+subtest 'autoLeave verhindert vor dem Snapshot einen impliziten Gruppenumbau' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	add_sonos('Sonos.B', 'uuid-b', 'uuid-a');
+	my ($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A,Sonos.B');
+	my ($blocked_id, $blocked_error) = main::AudioManager_Submit('Audio', 'play', {
+		target => 'player:Sonos.A', uri => 'http://fhem/clip.mp3',
+	});
+	like($blocked_id, qr/^audio-/, 'abgelehnter Auftrag bleibt nachvollziehbar');
+	is($blocked_error, undef, 'Schedulerfehler bleibt im Requeststatus sichtbar');
+	is(reading_value('Audio', 'lastRequestState'), 'failed', 'Auftrag scheitert kontrolliert');
+	like(reading_value('Audio', 'lastError'), qr/autoLeave=0/, 'Fehler nennt die fehlende Freigabe');
+	ok(!grep(/leaveGroup/, @{ command_log() }), 'ohne Freigabe wird kein Gruppenkommando gesendet');
+	is($hash->{helper}{baselines}{sonos2mqtt}, undef, 'vor der Ablehnung wird kein Baseline-Restore angelegt');
+	is(main::AudioManager_Attr('set', 'Audio', 'autoLeave', '1'), undef, 'Freigabe wird gesetzt');
+	my (undef, $allowed_error) = main::AudioManager_Submit('Audio', 'play', {
+		target => 'player:Sonos.A', uri => 'http://fhem/clip.mp3',
+	});
+	is($allowed_error, undef, 'derselbe Zielumbau wird mit Freigabe angenommen');
+	ok(grep($_ eq 'set Sonos.B leaveGroup', @{ command_log() }), 'Child wird erst nach Freigabe getrennt');
+};
+
+subtest 'TTS startet sofort, Duplikate werden verworfen und Clips spielen einzeln' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	add_tts('SonosTTS');
+	$main::attr{Audio}{ttsDevice} = 'SonosTTS';
+	$main::attr{Audio}{speakDedupeWindow} = 5;
+	my ($hash, $error) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	is($error, undef, 'Manager mit TTS wird definiert');
+	is(main::AudioManager_Set($hash, 'Audio', 'speak', 'Hallo Welt!'), undef, 'erste Sprache wird angenommen');
+	ok(grep($_ eq 'set SonosTTS tts Hallo Welt!', @{ command_log() }), 'TTS-Erzeugung startet im selben Aufruf');
+	is(main::AudioManager_Set($hash, 'Audio', 'speak', 'hallo', 'welt.'), undef, 'normalisiertes Duplikat wird angenommen aber verworfen');
+	is(reading_value('Audio', 'lastRequestState'), 'deduplicated', 'Duplikatstatus ist sichtbar');
+	is(scalar(grep { /^set SonosTTS tts / } @{ command_log() }), 1, 'Duplikat erzeugt keine zweite TTS-Anfrage');
+
+	# Der erste Poll sieht die laufende Erzeugung, der zweite die fertige URL.
+	run_next_timer();
+	set_reading('SonosTTS', 'httpName', 'http://fhem/speech-1.mp3');
+	set_reading('SonosTTS', 'lastFilename', 'speech-1.mp3');
+	set_reading('SonosTTS', 'playing', 0);
+	run_next_timer();
+	ok(grep($_ eq 'set Sonos.A playUri http://fhem/speech-1.mp3', @{ command_log() }), 'fertige TTS-URI wird direkt am Speaker abgespielt');
+	is(reading_value('Audio', 'currentType'), 'speak', 'Sprachauftrag ist aktiv sichtbar');
+
+	# Ein zweiter unterschiedlicher Text startet sofort seine eigene Erzeugung.
+	is(main::AudioManager_Set($hash, 'Audio', 'speak', 'Zweiter Text'), undef, 'zweiter Text wird angenommen');
+	ok(grep($_ eq 'set SonosTTS tts Zweiter Text', @{ command_log() }), 'zweite TTS-Erzeugung startet unabhaengig');
+};
+
+subtest 'Say-Kompatibilitaet trennt Listenvertrag und skalare Fehlerausgabe' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	add_tts('SonosTTS');
+	$main::attr{Audio}{ttsDevice} = 'SonosTTS';
+	my ($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	my ($request_id, $list_error) = main::AudioManager_Say(
+		'Audio', 'Listenaufruf', 'player:Sonos.A',
+	);
+	like($request_id, qr/^audio-/, 'Listenkontext liefert weiterhin die Request-ID');
+	is($list_error, undef, 'Listenkontext meldet bei erfolgreicher Annahme keinen Fehler');
+	is(
+		scalar(main::AudioManager_Say('Audio', 'Skalaraufruf', 'player:Sonos.A')),
+		undef,
+		'skalarer Say-Alias gibt bei erfolgreicher Annahme keine 2 mehr aus',
+	);
+	is(
+		scalar(main::AudioManager_Say('Audio.Fehlend', 'Fehler', 'player:Sonos.A')),
+		'AudioManager Audio.Fehlend existiert nicht',
+		'skalarer Say-Alias reicht eine echte Fehlermeldung durch',
+	);
+};
+
+subtest 'TTS-Notify gibt auch eine unveraenderte Cache-URI ohne Workerwartezeit frei' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	my $tts = add_tts('SonosTTS');
+	set_reading('SonosTTS', 'httpName', 'http://fhem/cache.mp3');
+	set_reading('SonosTTS', 'lastFilename', 'cache.mp3');
+	$main::attr{Audio}{ttsDevice} = 'SonosTTS';
+	my ($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	is(main::AudioManager_Set($hash, 'Audio', 'speak', 'Gecachter Text'), undef, 'Cachetext wird angenommen');
+	ok(!grep(/playUri/, @{ command_log() }), 'laufende Erzeugung verwendet die alte URI noch nicht');
+	set_reading('SonosTTS', 'playing', 0);
+	$tts->{CHANGED} = ['playing: 0'];
+	is(main::AudioManager_Notify($hash, $tts), undef, 'Abschlussereignis wird verarbeitet');
+	ok(
+		grep($_ eq 'set Sonos.A playUri http://fhem/cache.mp3', @{ command_log() }),
+		'unveraenderte Cache-URI startet direkt im Notify-Aufruf',
+	);
+};
+
+subtest 'Prioritaet pausiert Stream und setzt ihn nach einem Clip fort' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	my ($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	is(main::AudioManager_Set($hash, 'Audio', 'stream', 'Antenne', 'Muenster'), undef, 'Favoritenstream startet');
+	ok(grep($_ eq 'set Sonos.A playFav Antenne Muenster', @{ command_log() }), 'playFav wird ohne Bridge verwendet');
+	is(main::AudioManager_Set($hash, 'Audio', 'play', 'http://fhem/gong.mp3'), undef, 'Clip wird angenommen');
+	ok(grep($_ eq 'set Sonos.A pause', @{ command_log() }), 'Stream wird vor dem Clip pausiert');
+	ok(grep($_ eq 'set Sonos.A playUri http://fhem/gong.mp3', @{ command_log() }), 'Clip startet am Speaker');
+
+	# Transportende nach bestaetigtem Start beendet den Clip und startet Restore/Resume.
+	run_next_timer();
+	set_reading('Sonos.A', 'transportState', 'STOPPED');
+	advance_time(3);
+	run_next_timer();
+	my @favorite_commands = grep { $_ eq 'set Sonos.A playUri favorite:Antenne Muenster' || $_ eq 'set Sonos.A playFav Antenne Muenster' } @{ command_log() };
+	ok(@favorite_commands >= 1, 'unterbrochener Streamzustand wird wiederhergestellt');
+};
+
+subtest 'Stream erkennt URL anhand ihres Schemas als dauerhafte URI' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	my ($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	is(
+		main::AudioManager_Set($hash, 'Audio', 'stream', 'https://radio.example/live'),
+		undef,
+		'URL-Stream wird angenommen',
+	);
+	my ($stream) = grep { $_->{type} eq 'stream' } @{ $hash->{helper}{core}->requests };
+	is($stream->{payload}{uri}, 'https://radio.example/live', 'Schemaerkennung speichert die Stream-URI');
+	ok(!exists($stream->{payload}{favorite}), 'URL wird nicht zusaetzlich als Favorit behandelt');
+	ok(
+		grep($_ eq 'set Sonos.A playUri https://radio.example/live', @{ command_log() }),
+		'URI-Stream startet ueber playUri',
+	);
+};
+
+subtest 'kurze TTS endet per MP3-Dauer und setzt den eigenen Favoriten fort' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	my $tts = add_tts('SonosTTS');
+	$main::attr{Audio}{ttsDevice} = 'SonosTTS';
+	my ($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	is(main::AudioManager_Set($hash, 'Audio', 'stream', 'Antenne.Muenster'), undef, 'Radio startet');
+	my $favorite_starts = grep { $_ eq 'set Sonos.A playFav Antenne.Muenster' } @{ command_log() };
+	set_reading('Sonos.A', 'currentTrack_TrackUri', 'http://fhem/vogel/alt.mp3');
+	is(main::AudioManager_Set($hash, 'Audio', 'speak', 'Kurze Ansage'), undef, 'Ansage wird erzeugt');
+	set_reading('SonosTTS', 'httpName', 'http://fhem/speech-short.mp3');
+	set_reading('SonosTTS', 'lastFilename', 'speech-short.mp3');
+	set_reading('SonosTTS', 'playing', 0);
+	$tts->{CHANGED} = ['playing: 0'];
+	is(main::AudioManager_Notify($hash, $tts), undef, 'fertige TTS-URI wird freigegeben');
+	my ($speak) = grep { $_->{type} eq 'speak' } @{ $hash->{helper}{core}->requests };
+	is($speak->{payload}{tts_duration}, 3, 'Renderer-Dauer wird im Sprachauftrag gespeichert');
+	ok(
+		defined($speak->{runtime}{backends}{sonos2mqtt}{playback_started_at}),
+		'Quellenbefehl setzt den Zeitanker fuer die Startfrist',
+	);
+	set_reading('Sonos.A', 'currentTrack_TrackUri', 'http://fhem/vogel/alt.mp3');
+	set_reading('Sonos.A', 'transportState', 'STOPPED');
+	advance_time(3);
+
+	# Eine alte, weiterhin gestoppte Quelle darf den TTS-Dauertimer nicht starten.
+	main::AudioManager_Worker($hash);
+	is($speak->{state}, 'active', 'kurze TTS bleibt bis zur bestaetigten Wiedergabe aktiv');
+	ok(
+		!exists($speak->{runtime}{playback_confirmed_at}{sonos2mqtt}),
+		'altes Transportreading gilt nicht als Startbestaetigung',
+	);
+
+	# Erst die angeforderte URI mit aktivem Transport startet die fachliche MP3-Dauer.
+	set_reading('Sonos.A', 'currentTrack_TrackUri', 'http://fhem/speech-short.mp3');
+	set_reading('Sonos.A', 'transportState', 'PLAYING');
+	main::AudioManager_Worker($hash);
+	is($speak->{state}, 'active', 'Startbestaetigung beendet den Clip nicht vorzeitig');
+	ok(
+		defined($speak->{runtime}{playback_confirmed_at}{sonos2mqtt}),
+		'bestaetigte TTS-URI setzt den Zeitanker fuer die Dauerpruefung',
+	);
+	advance_time(3);
+
+	# Der AudioManager-Worker bewertet die Dauer ab der bestaetigten Wiedergabe;
+	# andere noch geplante TTS-Timer duerfen den Testzeitpunkt nicht beeinflussen.
+	main::AudioManager_Worker($hash);
+	is($speak->{state}, 'completed', 'kurze hoerbare TTS wird nicht als unbestaetigt verworfen');
+	is(
+		$speak->{runtime}{playback_confirmation},
+		'tts_duration',
+		'MP3-Dauer ist als Fallback-Bestaetigung nachvollziehbar',
+	);
+	ok(
+		grep($_ eq 'set Sonos.A stop', @{ command_log() }),
+		'das Dauerende stoppt den TTS-Transport vor einer moeglichen Wiederholung',
+	);
+	cmp_ok(
+		scalar(grep { $_ eq 'set Sonos.A playFav Antenne.Muenster' } @{ command_log() }),
+		'>',
+		$favorite_starts,
+		'Resume startet den Stream aus seinem Favoritennamen',
+	);
+	ok(
+		!grep($_ eq 'set Sonos.A playUri http://fhem/vogel/alt.mp3', @{ command_log() }),
+		'veraltetes Vogelreading wird nicht wieder gestartet',
+	);
+};
+
+subtest 'stop per fehlgeschlagener Request-ID erreicht den Player erneut' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	my ($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	my ($id, $submit_error) = main::AudioManager_Submit('Audio', 'queue', {
+		uris => ['http://fhem/vogel/01.mp3'],
+	});
+	is($submit_error, undef, 'Vogelqueue wird angenommen');
+	$hash->{helper}{core}->fail($id, 'simulierter Queuefehler');
+	@{ command_log() } = ();
+
+	# Das Makro behaelt bei einem Fehler die exakte ID und erwartet einen echten Playerstopp.
+	is(main::AudioManager_Set($hash, 'Audio', 'stop', $id), undef, 'fehlgeschlagener Stopp bleibt idempotent erfolgreich');
+	ok(
+		grep($_ eq 'set Sonos.A stop', @{ command_log() }),
+		'auch die fehlgeschlagene Request-ID sendet erneut stop an Sonos',
+	);
+	is($hash->{helper}{core}->request($id)->{state}, 'failed', 'der nachvollziehbare Fehlerstatus bleibt erhalten');
+};
+
+subtest 'stop all erreicht den juengsten fehlgeschlagenen Request erneut' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	my ($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	my ($id, $submit_error) = main::AudioManager_Submit('Audio', 'queue', {
+		uris => ['http://fhem/vogel/01.mp3'],
+	});
+	is($submit_error, undef, 'Vogelqueue wird angenommen');
+	$hash->{helper}{core}->fail($id, 'simulierter Queuefehler');
+	@{ command_log() } = ();
+
+	# Der allgemeine Stopp muss einen terminalen, moeglicherweise weiterlaufenden Request erreichen.
+	is(main::AudioManager_Set($hash, 'Audio', 'stop'), undef, 'allgemeiner Stopp bleibt idempotent erfolgreich');
+	ok(
+		grep($_ eq 'set Sonos.A stop', @{ command_log() }),
+		'stop all wiederholt den physischen Sonos-Stopp des letzten Fehlers',
+	);
+	is($hash->{helper}{core}->request($id)->{state}, 'failed', 'der Fehlerstatus bleibt bei stop all erhalten');
+	@{ command_log() } = ();
+
+	# Der typbezogene Stopp verwendet dieselbe sichere Wiederholung nur fuer passende Audioarten.
+	is(main::AudioManager_Set($hash, 'Audio', 'stop', 'queue'), undef, 'typbezogener Stopp bleibt idempotent erfolgreich');
+	ok(
+		grep($_ eq 'set Sonos.A stop', @{ command_log() }),
+		'stop queue wiederholt den physischen Sonos-Stopp des letzten Queuefehlers',
+	);
+};
+
+subtest 'stop target begrenzt Abbruch und physischen Stopp auf Player oder Gruppe' => sub {
+	reset_env();
+	add_sonos('Sonos.FlurEG', 'uuid-flur');
+	add_sonos('Sonos.FlurOG', 'uuid-flur-og', 'uuid-flur');
+	add_sonos('Sonos.Kueche', 'uuid-kueche');
+	my ($hash, $error) = define_manager(
+		'Audio', 'sonos2mqtt=Sonos.FlurEG,Sonos.FlurOG,Sonos.Kueche',
+	);
+	is($error, undef, 'Manager fuer eine Gruppe und einen Standalone-Player wird definiert');
+	my ($group_id, $group_error) = main::AudioManager_Submit('Audio', 'stream', {
+		target => 'group:Sonos.FlurEG', favorite => 'Flurradio',
+	});
+	is($group_error, undef, 'Gruppenstream wird angenommen');
+	my ($player_id, $player_error) = main::AudioManager_Submit('Audio', 'stream', {
+		target => 'player:Sonos.Kueche', favorite => 'Kuechenradio',
+	});
+	is($player_error, undef, 'disjunkter Playerstream wird parallel angenommen');
+	@{ command_log() } = ();
+
+	# Der Gruppenstopp beendet nur den ueberlappenden Request und dessen Coordinator.
+	is(
+		main::AudioManager_Set($hash, 'Audio', 'stop', 'target=group:Sonos.FlurEG'),
+		undef,
+		'Gruppenziel wird gestoppt',
+	);
+	ok(
+		grep($_ eq 'set Sonos.FlurEG stop', @{ command_log() }),
+		'Gruppenstopp erreicht den aktuellen Coordinator',
+	);
+	ok(
+		!grep($_ eq 'set Sonos.Kueche stop', @{ command_log() }),
+		'disjunkter Player wird vom Gruppenstopp nicht beeinflusst',
+	);
+	is($hash->{helper}{core}->request($group_id)->{state}, 'cancelled', 'Gruppenrequest ist beendet');
+	is($hash->{helper}{core}->request($player_id)->{state}, 'active', 'Playerrequest bleibt aktiv');
+	@{ command_log() } = ();
+
+	# Der Playerstopp beendet anschliessend nur den explizit genannten Standalone-Player.
+	is(
+		main::AudioManager_Set($hash, 'Audio', 'stop', 'target=player:Sonos.Kueche'),
+		undef,
+		'Playerziel wird gestoppt',
+	);
+	ok(
+		grep($_ eq 'set Sonos.Kueche stop', @{ command_log() }),
+		'Playerstopp erreicht den Standalone-Player',
+	);
+	is($hash->{helper}{core}->request($player_id)->{state}, 'cancelled', 'Playerrequest ist beendet');
+	@{ command_log() } = ();
+
+	# Ohne offenen Request bleibt derselbe Zielstopp ein echter, idempotenter Backendbefehl.
+	is(
+		main::AudioManager_Set($hash, 'Audio', 'stop', 'target=player:Sonos.Kueche'),
+		undef,
+		'wiederholter Playerstopp bleibt erfolgreich',
+	);
+	ok(
+		grep($_ eq 'set Sonos.Kueche stop', @{ command_log() }),
+		'wiederholter Zielstopp wird bis zum Backend durchgereicht',
+	);
+	like(
+		main::AudioManager_Set($hash, 'Audio', 'stop', 'target=player:Sonos.Unbekannt'),
+		qr/Unbekannter Audio-Player/,
+		'nicht verwaltete Zielplayer werden abgelehnt',
+	);
+};
+
+subtest 'direkte API und Zielzonen umgehen keine Verwaltungsgrenze' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	add_sonos('Sonos.B', 'uuid-b');
+	$main::attr{Audio}{zones} = 'Kueche=Sonos.B';
+	my ($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A,Sonos.B');
+	my ($id, $error) = main::AudioManager_Submit('Audio', 'play', {
+		target => 'zone:Kueche', uri => 'http://fhem/klingel.mp3', volume => 40,
+	});
+	like($id, qr/^audio-/, 'direkte API liefert Request-ID');
+	is($error, undef, 'direkte API meldet keinen Fehler');
+	ok(grep($_ eq 'set Sonos.B playUri http://fhem/klingel.mp3', @{ command_log() }), 'Zone spielt nur auf ihrem Player');
+	ok(!grep($_ eq 'set Sonos.A playUri http://fhem/klingel.mp3', @{ command_log() }), 'anderer Player bleibt unangetastet');
+	my (undef, $target_error) = main::AudioManager_Submit('Audio', 'play', {
+		target => 'player:Sonos.Fremd', uri => 'x',
+	});
+	like($target_error, qr/Unbekannter Audio-Player/, 'fremdes Ziel wird abgelehnt');
+	my (undef, $type_error) = main::AudioManager_Submit('Audio', 'unknown', {});
+	like($type_error, qr/Unbekannte Audioart/, 'ungueltige direkte Audioart bleibt ein normaler Fehler');
+};
+
+subtest 'direkte Queue-API kann individuelle Mute- und Lautstaerken unveraendert lassen' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a', undef, volume => 37, mute => 'true');
+	my ($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	my ($id, $error) = main::AudioManager_Submit('Audio', 'queue', {
+		target => 'player:Sonos.A',
+		volume_policy => 'keep',
+		mute_policy => 'keep',
+	});
+	like($id, qr/^audio-/, 'Queue-Automation erhaelt eine Request-ID');
+	is($error, undef, 'request-lokale Keep-Policies werden angenommen');
+	ok(!grep(/^set Sonos[.]A (?:mute|volume) /, @{ command_log() }), 'individuelle Audiowerte bleiben unveraendert');
+	ok(grep($_ eq 'set Sonos.A input Queue', @{ command_log() }), 'Queue-Eingang wird trotzdem gesetzt');
+	ok(grep($_ eq 'set Sonos.A play', @{ command_log() }), 'Queue wird trotzdem gestartet');
+	my (undef, $volume_error) = main::AudioManager_Submit('Audio', 'queue', {
+		target => 'player:Sonos.A',
+		volume_policy => 'ungueltig',
+	});
+	like($volume_error, qr/volume_policy/, 'ungueltige direkte Volume-Policy wird abgelehnt');
+	my (undef, $mute_error) = main::AudioManager_Submit('Audio', 'queue', {
+		target => 'player:Sonos.A',
+		mute_policy => 'ungueltig',
+	});
+	like($mute_error, qr/mute_policy/, 'ungueltige direkte Mute-Policy wird abgelehnt');
+};
+
+subtest 'Fade-in ist Set-Option und URI-Queues gehoeren vollstaendig dem Manager' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a', undef, volume => 20);
+	my ($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	is(
+		main::AudioManager_Set(
+			$hash, 'Audio', 'play', 'target=player:Sonos.A', 'volume=20',
+			'fadein=10', 'http://fhem/gong.mp3',
+		),
+		undef,
+		'fadein wird als fuehrende Set-Option angenommen',
+	);
+	ok(grep($_ eq 'set Sonos.A volume 2', @{ command_log() }), 'Clip startet bei zehn Prozent');
+	advance_time(5);
+	run_next_timer();
+	ok(grep($_ eq 'set Sonos.A volume 11', @{ command_log() }), 'Worker setzt den linearen Halbzeitpegel');
+	like(
+		main::AudioManager_Set($hash, 'Audio', 'play', 'fadein=86401', 'http://fhem/gong.mp3'),
+		qr/fadein muss zwischen/,
+		'zu lange Fade-Dauer wird vor Annahme abgelehnt',
+	);
+
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a', undef, volume => 15);
+	($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	my ($id, $error) = main::AudioManager_Submit('Audio', 'queue', {
+		target => 'group:Sonos.A',
+		uris => ['http://fhem/vogel/a.mp3', 'http://fhem/vogel/b.mp3'],
+		fadein => 300,
+	});
+	like($id, qr/^audio-/, 'verwaltete URI-Queue erhaelt eine Request-ID');
+	is($error, undef, 'URI-Liste und Fade-Dauer werden gemeinsam angenommen');
+	is(
+		scalar(grep(/AVTransportService[.]AddURIToQueue/, @{ command_log() })),
+		2,
+		'AudioManager baut die native Queue selbst auf',
+	);
+	run_next_timer();
+	ok(
+		grep(/"command":"playmode","input":"REPEAT_ALL"/, @{ command_log() }),
+		'Manager setzt die verwaltete Queue auf Wiederholung',
+	);
+	ok(grep($_ eq 'set Sonos.A play', @{ command_log() }), 'Manager startet die aufgebaute Queue selbst');
+
+	my (undef, $empty_error) = main::AudioManager_Submit('Audio', 'queue', { uris => [] });
+	like($empty_error, qr/nichtleere Liste/, 'eine leere URI-Liste wird abgelehnt');
+	my (undef, $type_error) = main::AudioManager_Submit('Audio', 'play', {
+		uri => 'http://fhem/gong.mp3',
+		uris => ['http://fhem/vogel/a.mp3'],
+	});
+	like($type_error, qr/nur fuer queue/, 'URI-Listen koennen nicht an andere Audioarten gelangen');
+	my (undef, $keep_error) = main::AudioManager_Submit('Audio', 'queue', {
+		uris => ['http://fhem/vogel/a.mp3'],
+		fadein => 10,
+		volume_policy => 'keep',
+	});
+	like($keep_error, qr/nicht mit volume_policy=keep/, 'Fade und unveraenderte Lautstaerke widersprechen sich nicht still');
+};
+
+subtest 'acht raspi-01-Speaker einschliesslich Raw-only TV werden gemeinsam verwaltet' => sub {
+	reset_env();
+	my @players = qw(
+		Sonos.FlurEG Sonos.FlurKE Sonos.Kueche Sonos.Schlafen
+		Sonos.Wintergarten Sonos.Wintergarten.TV Sonos.Wohnen Sonos.Wohnen.TV
+	);
+	my $number = 0;
+
+	# Die echten Device-Namen bilden mit stabilen Test-UUIDs die raspi-01-Struktur ab.
+	for my $player (@players) {
+		$number++;
+		add_sonos($player, "uuid-$number");
+	}
+
+	$main::attr{'Sonos.Wohnen.TV'}{setList} = 'x_raw_payload:textField';
+	my ($hash, $error) = define_manager('Audio', 'sonos2mqtt=' . join(',', @players));
+	is($error, undef, 'alle acht vorhandenen Speaker werden ohne Bridge definiert');
+	is(reading_value('Audio', 'playerCount'), 8, 'Verwaltungsgrenze enthaelt alle acht Player');
+	is(
+		main::AudioManager_Set(
+			$hash, 'Audio', 'stream',
+			'target=players:Sonos.Wohnen.TV,Sonos.Kueche', 'Antenne',
+		),
+		undef,
+		'Favoritenauftrag mit Raw-only TV wird angenommen',
+	);
+	run_next_timer();
+	run_next_timer();
+	ok(
+		grep(
+			$_ eq 'set Sonos.Wohnen.TV x_raw_payload {"command":"joingroup","input":"Sonos.Kueche"}',
+			@{ command_log() },
+		),
+		'Raw-only TV tritt der temporaeren Gruppe per offiziellem Rohbefehl bei',
+	);
+	ok(
+		grep($_ eq 'set Sonos.Kueche playFav Antenne', @{ command_log() }),
+		'Favorit startet am vollwertigen Coordinator',
+	);
+};
+
+subtest 'group add uebersetzt den FHEM-Devicenamen fuer sonos2mqtt' => sub {
+	reset_env();
+	add_sonos('Sonos.FlurEG', 'uuid-flur', undef, name => 'Flur EG');
+	add_sonos('Sonos.Wohnen', 'uuid-wohnen', undef, name => 'Wohnen');
+	my ($hash, $error) = define_manager('Audio', 'sonos2mqtt=Sonos.FlurEG,Sonos.Wohnen');
+	is($error, undef, 'Manager fuer zwei unterschiedlich benannte Speaker wird definiert');
+	is(
+		main::AudioManager_Set(
+			$hash, 'Audio', 'group', 'add', 'Sonos.Wohnen', 'Sonos.FlurEG',
+		),
+		undef,
+		'group add wird erfolgreich ausgefuehrt',
+	);
+	ok(
+		grep($_ eq 'set Sonos.Wohnen joinGroup Flur EG', @{ command_log() }),
+		'der sonos2mqtt-Setter erhaelt den sichtbaren Sonos-Namen',
+	);
+	is(
+		reading_value('Sonos.Wohnen', 'coordinatorUuid'),
+		'uuid-flur',
+		'das Gruppenreading bestaetigt den Beitritt',
+	);
+};
+
+subtest 'Defaultziel all verteilt play auf vorhandene Sonos-Gruppen' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	add_sonos('Sonos.B', 'uuid-b', 'uuid-a');
+	add_sonos('Sonos.C', 'uuid-c');
+	my ($hash, $error) = define_manager('Audio', 'sonos2mqtt=Sonos.A,Sonos.B,Sonos.C');
+	is($error, undef, 'Manager mit einer Gruppe und einem Standalone-Player wird definiert');
+	is(
+		main::AudioManager_Set($hash, 'Audio', 'play', 'volume=40', 'http://fhem/gong.mp3'),
+		undef,
+		'play ohne target wird trotz autoLeave=0 angenommen',
+	);
+	ok(
+		grep($_ eq 'set Sonos.A playUri http://fhem/gong.mp3', @{ command_log() }),
+		'Gruppencoordinator erhaelt den Gong',
+	);
+	ok(
+		grep($_ eq 'set Sonos.C playUri http://fhem/gong.mp3', @{ command_log() }),
+		'Standalone-Player erhaelt den Gong separat',
+	);
+	ok(
+		!grep(/(?:leaveGroup|joinGroup)/, @{ command_log() }),
+		'all veraendert keine vorhandene Gruppe',
+	);
+};
+
+subtest 'all erweitert eine laufende Stream-Baseline nur um neue Gruppen' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	add_sonos('Sonos.B', 'uuid-b', 'uuid-a');
+	add_sonos(
+		'Sonos.C', 'uuid-c', undef,
+		transportState => 'PLAYING', uri => 'http://extern/tv.mp3',
+	);
+	my ($hash, $error) = define_manager('Audio', 'sonos2mqtt=Sonos.A,Sonos.B,Sonos.C');
+	is($error, undef, 'Manager fuer Radio- und externe Standalone-Gruppe wird definiert');
+	is(
+		main::AudioManager_Set(
+			$hash, 'Audio', 'stream', 'target=group:Sonos.A', 'Antenne.Muenster',
+		),
+		undef,
+		'Radio startet nur in der vorhandenen Zweiergruppe',
+	);
+	is(
+		main::AudioManager_Set($hash, 'Audio', 'play', 'volume=40', 'http://fhem/gong.mp3'),
+		undef,
+		'all-Gong unterbricht das Radio und erreicht die Standalone-Gruppe',
+	);
+	my $baselines = $hash->{helper}{baselines}{sonos2mqtt};
+	is(scalar(@$baselines), 2, 'neue Standalone-Gruppe erhaelt eine eigene Baseline');
+	is(
+		[ sort map { @{ $_->{snapshot}{scope} } } @$baselines ],
+		[qw(Sonos.A Sonos.B Sonos.C)],
+		'jede physische Ressource ist genau durch die Baselines abgedeckt',
+	);
+	main::AudioManager_Worker($hash);
+	set_reading('Sonos.A', 'transportState', 'STOPPED');
+	set_reading('Sonos.C', 'transportState', 'STOPPED');
+	advance_time(3);
+	main::AudioManager_Worker($hash);
+	ok(
+		grep($_ eq 'set Sonos.A playFav Antenne.Muenster', @{ command_log() }),
+		'Radio wird aus seinem Streamauftrag fortgesetzt',
+	);
+	ok(
+		grep($_ eq 'set Sonos.C playUri http://extern/tv.mp3', @{ command_log() }),
+		'externe Quelle der zusaetzlich beruehrten Gruppe wird restauriert',
+	);
+};
+
+subtest 'periodische ZoneInfo-Probes reparieren ausgefallene Player ohne externe Watcher' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	add_sonos('Sonos.B', 'uuid-b');
+	$main::attr{Audio}{healthDebounce} = 0;
+	$main::attr{Audio}{healthVerifyTimeout} = 5;
+	$main::attr{Audio}{healthRecoveryCooldown} = 0;
+	$main::attr{Audio}{healthProbeInterval} = 1;
+	my ($hash, $error) = define_manager('Audio', 'sonos2mqtt=Sonos.A,Sonos.B');
+	is($error, undef, 'Manager wird ohne Bridge und readingsWatcher definiert');
+	is(reading_value('Audio', 'backendHealth'), 'sonos2mqtt:healthy', 'Backend startet ohne bekannten Fehler');
+	is(reading_value('Audio', 'backendHealthError'), 'none', 'ohne Ausfall besteht kein aktueller Healthfehler');
+	is(scalar(@{ timers() }), 1, 'ein Langzeittimer plant den ersten Probe');
+	run_next_timer();
+	is(
+		scalar(grep(/GetZoneInfo/, @{ command_log() })),
+		2,
+		'erster Probe fragt jeden verwalteten Player direkt ab',
+	);
+	is(reading_value('Audio', 'backendHealth'), 'sonos2mqtt:verifying', 'Probe wartet auf direkte Antworten');
+
+	set_reading('Sonos.A', 'IPAddress', '192.168.1.11');
+	$main::defs{'Sonos.A'}{CHANGED} = ['IPAddress: 192.168.1.11'];
+	main::AudioManager_Notify($hash, $main::defs{'Sonos.A'});
+	set_reading('Sonos.B', 'IPAddress', '192.168.1.12');
+	$main::defs{'Sonos.B'}{CHANGED} = ['IPAddress: 192.168.1.12'];
+	main::AudioManager_Notify($hash, $main::defs{'Sonos.B'});
+	run_next_timer();
+	is(reading_value('Audio', 'backendHealth'), 'sonos2mqtt:healthy', 'beide ZoneInfo-Antworten bestaetigen den Probe');
+	is(reading_value('Audio', 'backendRecoveryCount'), 0, 'Routineprobe wird nicht als Recovery gezaehlt');
+	is(scalar(@{ timers() }), 1, 'danach bleibt nur der naechste Langzeittermin');
+
+	@AudioManagerTestEnv::COMMAND_LOG = ();
+	run_next_timer();
+	set_reading('Sonos.A', 'IPAddress', '192.168.1.11');
+	$main::defs{'Sonos.A'}{CHANGED} = ['IPAddress: 192.168.1.11'];
+	main::AudioManager_Notify($hash, $main::defs{'Sonos.A'});
+	run_next_timer();
+	run_next_timer();
+	is(
+		[grep(/^publish /, @{ command_log() })],
+		['publish Sonos.A sonos/cmd/check-subscriptions'],
+		'fehlende Antwort loest genau einen globalen Subscription-Refresh aus',
+	);
+	is(reading_value('Audio', 'backendRecoveryCount'), 1, 'nur der Reparaturversuch wird gezaehlt');
+	is(
+		scalar(grep(/Sonos.B x_raw_payload.*GetZoneInfo/, @{ command_log() })),
+		2,
+		'fehlender Player wurde einmal regulaer und einmal nach Recovery geprueft',
+	);
+	is(
+		scalar(grep { $_->{message} =~ /Player offline: Sonos\.B/ } @{ log_messages() }),
+		0,
+		'waehrend des ersten Reparaturversuchs wird noch kein Offlinefehler geloggt',
+	);
+
+	run_next_timer();
+	is(reading_value('Audio', 'backendHealth'), 'sonos2mqtt:degraded', 'unbeantworteter Wiederholungsprobe degradiert das Backend');
+	is(
+		reading_value('Audio', 'backendHealthError'),
+		'sonos2mqtt: Player offline: Sonos.B',
+		'das aktuelle Error-Reading nennt den ausgefallenen Player',
+	);
+	my @offline_logs = grep { $_->{message} =~ /Player offline: Sonos\.B/ } @{ log_messages() };
+	is(scalar(@offline_logs), 1, 'der endgueltige Offlinezustand wird genau einmal geloggt');
+	is($offline_logs[0]{level}, 2, 'der Offlinezustand verwendet Log-Level 2');
+	main::AudioManager_update_health($hash);
+	is(
+		scalar(grep { $_->{message} =~ /Player offline: Sonos\.B/ } @{ log_messages() }),
+		1,
+		'unveraenderter Offlinezustand erzeugt keinen weiteren Logeintrag',
+	);
+
+	run_next_timer();
+	set_reading('Sonos.A', 'IPAddress', '192.168.1.11');
+	$main::defs{'Sonos.A'}{CHANGED} = ['IPAddress: 192.168.1.11'];
+	main::AudioManager_Notify($hash, $main::defs{'Sonos.A'});
+	set_reading('Sonos.B', 'IPAddress', '192.168.1.12');
+	$main::defs{'Sonos.B'}{CHANGED} = ['IPAddress: 192.168.1.12'];
+	main::AudioManager_Notify($hash, $main::defs{'Sonos.B'});
+	run_next_timer();
+	advance_time(0.1);
+	set_reading('Sonos.B', 'IPAddress', '192.168.1.12');
+	$main::defs{'Sonos.B'}{CHANGED} = ['IPAddress: 192.168.1.12'];
+	main::AudioManager_Notify($hash, $main::defs{'Sonos.B'});
+	run_next_timer();
+	is(reading_value('Audio', 'backendHealth'), 'sonos2mqtt:healthy', 'Antwort des wiedergekehrten Players bestaetigt die Recovery');
+	is(reading_value('Audio', 'backendHealthError'), 'none', 'bestaetigte Wiederkehr loescht den aktuellen Healthfehler');
+	my @recovery_logs = grep { $_->{message} =~ /Backend sonos2mqtt wieder erreichbar/ } @{ log_messages() };
+	is(scalar(@recovery_logs), 1, 'die bestaetigte Wiederkehr wird genau einmal geloggt');
+	is($recovery_logs[0]{level}, 3, 'die Entwarnung verwendet Log-Level 3');
+	my $health = JSON::PP::decode_json(main::AudioManager_Get($hash, 'Audio', 'health'));
+	is($health->{sonos2mqtt}{details}{players}{'Sonos.B'}{status}, 'reachable', 'Get health zeigt den Player wieder erreichbar');
+};
+
+subtest 'Bridge-Availability wird automatisch erkannt und kann explizit ueberschrieben werden' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a');
+	add_bridge('Sonos.Bridge', 'sonos', 0);
+	$main::attr{Audio}{healthDebounce} = 0;
+	$main::attr{Audio}{healthProbeInterval} = 10;
+	my ($hash, $error) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	is($error, undef, 'Manager wird mit vorhandener Bridgezuordnung definiert');
+	is($hash->{NOTIFYDEV}, 'Sonos.A,Sonos.Bridge,global', 'Autoerkennung nimmt nur das Availability-Device hinzu');
+	my $health = JSON::PP::decode_json(main::AudioManager_Get($hash, 'Audio', 'health'));
+	is($health->{sonos2mqtt}{details}{availability}{mode}, 'auto', 'exakte Topiczuordnung wurde automatisch erkannt');
+	is($health->{sonos2mqtt}{details}{availability}{status}, '0', 'connected=0 ist als Bridgezustand sichtbar');
+	$main::defs{'Sonos.Bridge'}{CHANGED} = ['connected: 0'];
+	main::AudioManager_Notify($hash, $main::defs{'Sonos.Bridge'});
+	is(reading_value('Audio', 'backendHealth'), 'sonos2mqtt:degraded', 'Bridge-Offlineevent degradiert das Backend sofort');
+	set_reading('Sonos.Bridge', 'connected', 2);
+	$main::defs{'Sonos.Bridge'}{CHANGED} = ['connected: 2'];
+	main::AudioManager_Notify($hash, $main::defs{'Sonos.Bridge'});
+	run_next_timer();
+	ok(grep(/GetZoneInfo/, @{ command_log() }), 'connected=2 startet sofort einen Playerprobe');
+
+	add_bridge('Custom.Bridge', 'custom', 2);
+	is(
+		main::AudioManager_Attr('set', 'Audio', 'backendAvailability', 'sonos=Custom.Bridge:connected'),
+		undef,
+		'manuelle Zuordnung wird live uebernommen',
+	);
+	is($hash->{NOTIFYDEV}, 'Custom.Bridge,Sonos.A,global', 'manuelle Zuordnung ersetzt die automatisch erkannte Bridge');
+	$health = JSON::PP::decode_json(main::AudioManager_Get($hash, 'Audio', 'health'));
+	is($health->{sonos2mqtt}{details}{availability}{mode}, 'configured', 'manueller Modus bleibt diagnostizierbar');
+	is($health->{sonos2mqtt}{details}{availability}{device}, 'Custom.Bridge', 'konfiguriertes Device bleibt sichtbar');
+};
+subtest 'Mute stellt individuelle Zustaende wieder her und Force entmutet unabhaengig' => sub {
+	reset_env();
+	add_sonos('Sonos.A', 'uuid-a', undef, mute => 'false');
+	add_sonos('Sonos.B', 'uuid-b', undef, mute => 'true');
+	my ($hash, $error) = define_manager('Audio', 'sonos2mqtt=Sonos.A,Sonos.B');
+	is($error, undef, 'Manager fuer Mute-Tests wird definiert');
+
+	is(
+		main::AudioManager_Set($hash, 'Audio', 'mute', 'target=player:Sonos.A', 'on'),
+		undef,
+		'erster Zielplayer wird gemutet',
+	);
+	is($hash->{helper}{mute_snapshot}, { 'Sonos.A' => 'false' }, 'erster Zustand wird gesichert');
+	is(
+		main::AudioManager_Set($hash, 'Audio', 'mute', 'on'),
+		undef,
+		'ueberlappender Aufruf erweitert die laufende Mute-Phase',
+	);
+	is(
+		$hash->{helper}{mute_snapshot},
+		{ 'Sonos.A' => 'false', 'Sonos.B' => 'true' },
+		'bereits gesicherter Zustand bleibt erhalten und der zweite Player kommt hinzu',
+	);
+	is(reading_value('Sonos.A', 'mute'), 'true', 'zuvor offener Player ist gemutet');
+	is(reading_value('Sonos.B', 'mute'), 'true', 'bereits gemuteter Player bleibt gemutet');
+
+	is(
+		main::AudioManager_Set($hash, 'Audio', 'mute', 'target=player:Sonos.A', 'off'),
+		undef,
+		'Teilziel wird auf seinen Zustand vor der Mute-Phase zurueckgesetzt',
+	);
+	is(reading_value('Sonos.A', 'mute'), 'false', 'erster Player wird wieder entmutet');
+	is(reading_value('Sonos.B', 'mute'), 'true', 'nicht ausgewaehlter Player bleibt gemutet');
+	is($hash->{helper}{mute_snapshot}, { 'Sonos.B' => 'true' }, 'nur der offene Snapshot bleibt erhalten');
+	is(main::AudioManager_Set($hash, 'Audio', 'mute', 'off'), undef, 'restliche Mute-Phase wird beendet');
+	is(reading_value('Sonos.B', 'mute'), 'true', 'urspruenglich gemuteter Player wird nicht entmutet');
+	is($hash->{helper}{mute_snapshot}, {}, 'vollstaendig restaurierte Phase ist vergessen');
+
+	set_reading('Sonos.A', 'mute', 'true');
+	my $command_count = scalar @{ command_log() };
+	is(
+		main::AudioManager_Set($hash, 'Audio', 'mute', 'target=player:Sonos.A', 'off'),
+		undef,
+		'mute off ohne Snapshot bleibt ein sicherer No-op',
+	);
+	is(scalar(@{ command_log() }), $command_count, 'ohne Snapshot wird kein Unmute gesendet');
+	is(reading_value('Sonos.A', 'mute'), 'true', 'fremd gemuteter Player bleibt unveraendert');
+	is(
+		main::AudioManager_Set($hash, 'Audio', 'mute', 'target=player:Sonos.A', 'off', 'force'),
+		undef,
+		'Force entmutet auch ohne vorherigen Snapshot',
+	);
+	is(reading_value('Sonos.A', 'mute'), 'false', 'Force hat den Player sicher entmutet');
+
+	set_reading('Sonos.B', 'mute', 'true');
+	is(main::AudioManager_Set($hash, 'Audio', 'mute', 'on'), undef, 'neue Mute-Phase wird gesichert');
+	is(
+		main::AudioManager_Set($hash, 'Audio', 'mute', 'off', 'force'),
+		undef,
+		'Force entmutet alle Ziele unabhaengig vom gespeicherten Zustand',
+	);
+	is(reading_value('Sonos.A', 'mute'), 'false', 'Force entmutet den ersten Player');
+	is(reading_value('Sonos.B', 'mute'), 'false', 'Force entmutet auch den zuvor gemuteten Player');
+	is($hash->{helper}{mute_snapshot}, {}, 'Force verwirft die verbrauchten Snapshoteintraege');
+	like(
+		main::AudioManager_Set($hash, 'Audio', 'mute', 'on', 'force'),
+		qr/nur zusammen mit mute off/,
+		'Force ist fuer mute on nicht zulaessig',
+	);
+	like(
+		main::AudioManager_Set($hash, 'Audio', 'mute', 'force=1', 'off'),
+		qr/Usage:/,
+		'die alte Force-Key-Value-Form wird abgelehnt',
+	);
+	like(
+		main::AudioManager_Set($hash, 'Audio', 'volume', '20', 'force'),
+		qr/Usage:/,
+		'Volume akzeptiert das Mute-spezifische Force-Flag nicht',
+	);
+};
+
+subtest 'Medienreadings und FTUI-Steuerbefehle laufen ueber den Manager' => sub {
+	reset_env();
+	add_sonos(
+		'Sonos.A', 'uuid-a', undef,
+		transportState => 'PLAYING', volume => 10,
+		title => 'Californication', legacyTitle => 'vogel06.mp3',
+		artist => 'Red Hot Chili Peppers', legacyArtist => 'southstar',
+		album => 'By the Way', albumArtUri => 'https://radio.example/logo.png',
+		legacyAlbumArtUri => 'https://radio.example/old.png',
+	);
+	my ($hash, $error) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
+	is($error, undef, 'Manager fuer Medienreadings wird definiert');
+	is(reading_value('Audio', 'mediaType'), 'none', 'ohne Managerauftrag ist keine Medienart aktiv');
+	is(reading_value('Audio', 'title'), '', 'ohne Managerauftrag bleibt der Titel leer');
+	is(
+		main::AudioManager_Set(
+			$hash, 'Audio', 'stream', 'target=group:Sonos.A', 'Radio.7.ULM',
+		),
+		undef,
+		'Radiostream wird zentral gestartet',
+	);
+	is(reading_value('Audio', 'mediaType'), 'stream', 'Manager weist den aktiven Stream aus');
+	is(reading_value('Audio', 'source'), 'Radio.7.ULM', 'Favoritenname wird als Quelle gespiegelt');
+	is(reading_value('Audio', 'title'), 'Californication', 'aktuelles Titelreading wird gespiegelt');
+	is(reading_value('Audio', 'artist'), 'Red Hot Chili Peppers', 'aktuelles Artistreading wird gespiegelt');
+	is(reading_value('Audio', 'albumArtUri'), 'https://radio.example/logo.png', 'aktuelles Cover wird gespiegelt');
+	is(reading_value('Audio', 'mediaPlayer'), 'Sonos.A', 'Coordinator bleibt diagnostizierbar');
+
+	set_reading('Sonos.A', 'currentTrack_title', 'Under the Bridge');
+	$main::defs{'Sonos.A'}{CHANGED} = ['currentTrack_title: Under the Bridge'];
+	main::AudioManager_Notify($hash, $main::defs{'Sonos.A'});
+	is(reading_value('Audio', 'title'), 'Under the Bridge', 'Notify aktualisiert den Managertitel sofort');
+	is(
+		main::AudioManager_Set(
+			$hash, 'Audio', 'transport', 'target=group:Sonos.A', 'pause',
+		),
+		undef,
+		'Pause wird ueber den Manager angenommen',
+	);
+	ok(grep($_ eq 'set Sonos.A pause', @{ command_log() }), 'Manager adressiert den Coordinator');
+	is(reading_value('Audio', 'transportState'), 'PAUSED_PLAYBACK', 'Transportreading folgt der Pause');
+	is(
+		main::AudioManager_Set(
+			$hash, 'Audio', 'volumeStep', 'target=player:Sonos.A', 'down',
+		),
+		undef,
+		'Lautstaerkeschritt wird ueber den Manager angenommen',
+	);
+	is(reading_value('Sonos.A', 'volume'), 9, 'Zielplayer wurde um einen Schritt abgesenkt');
+	is(
+		main::AudioManager_Set($hash, 'Audio', 'stop', 'target=group:Sonos.A'),
+		undef,
+		'Stream wird zentral gestoppt',
+	);
+	is(reading_value('Audio', 'mediaType'), 'none', 'Stopp leert die aktive Medienart');
+	is(reading_value('Audio', 'source'), 'none', 'Stopp leert die aktive Quelle');
+	is(reading_value('Audio', 'title'), '', 'Stopp entfernt den vorherigen Titel');
+};
+
+done_testing;

@@ -1,0 +1,6 @@
+UPD 2026-08-26_17:16:03 103656 FHEM/90_AudioManager.pm
+UPD 2026-08-26_17:01:57 5666 lib/AudioManager/Backend.pm
+UPD 2026-08-26_17:01:57 68271 lib/AudioManager/Backend/Sonos2mqtt.pm
+UPD 2026-08-25_19:22:23 17118 lib/AudioManager/Core.pm
+UPD 2026-08-25_19:32:20 4990 lib/AudioManager/FHEMGateway.pm
+UPD 2026-08-25_19:22:12 17561 lib/AudioManager/Supervisor.pm
