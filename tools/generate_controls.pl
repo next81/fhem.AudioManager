@@ -9,8 +9,8 @@ use POSIX qw(strftime);
 my $output = 'controls_AudioManager.txt';
 my @files = ('FHEM/90_AudioManager.pm');
 
-# Das Controlfile liefert nur produktive Perlmodule aus; Tests, Werkzeuge und
-# Dokumentation bleiben Bestandteile des Repositories, aber nicht des FHEM-Updates.
+# controls-Dateien muessen neben dem FHEM-Modul alle ausgelieferten
+# Bibliotheksmodule enthalten. Test- und Dokumentationsdateien gehoeren nicht dazu.
 find(
 	{
 		no_chdir => 1,
@@ -22,29 +22,39 @@ find(
 	'lib/AudioManager',
 );
 
-# Ermittelt die Auslieferungslaenge mit LF-Zeilenenden, wie GitHub sie bereitstellt.
+my %seen;
+
 sub delivery_size {
 	my ($file) = @_;
-	open my $input, '<:raw', $file or die "Kann $file nicht lesen: $!\n";
+	open my $input, '<:raw', $file
+		or die "Kann $file nicht lesen: $!\n";
 	local $/;
 	my $content = <$input>;
 	close $input or die "Kann $file nicht schliessen: $!\n";
+
+	# GitHub liefert die durch .gitattributes festgelegten LF-Zeilenenden aus.
+	# Ein Windows-Checkout kann trotzdem noch CRLF enthalten, dessen zusaetzliche
+	# CR-Bytes nicht in die Control-Datei eingehen duerfen.
 	$content =~ s/\r\n/\n/g;
 	return length($content);
 }
 
-my %seen;
+# Sortierung und Deduplizierung machen die Ausgabe reproduzierbar.
 @files = sort grep { !$seen{$_}++ } @files;
-open my $controls, '>:raw', $output or die "Kann $output nicht schreiben: $!\n";
 
-# Jede Produktionsdatei erscheint genau einmal mit portablem Slash-Pfad.
+open my $controls, '>:raw', $output
+	or die "Kann $output nicht schreiben: $!\n";
+
 for my $file (@files) {
 	my @stat = stat($file);
 	die "Kann $file nicht lesen: $!\n" if !@stat;
 	my $path = $file;
+
+	# FHEM-controls verwenden auch unter Windows portable Slash-Pfade.
 	$path =~ s{\\}{/}g;
 	my $timestamp = strftime('%Y-%m-%d_%H:%M:%S', localtime($stat[9]));
-	print {$controls} "UPD $timestamp " . delivery_size($file) . " $path\n";
+	my $size = delivery_size($file);
+	print {$controls} "UPD $timestamp $size $path\n";
 }
 
 close $controls or die "Kann $output nicht schliessen: $!\n";
