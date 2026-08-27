@@ -3,6 +3,7 @@ use warnings;
 use Test2::V0;
 use Time::Local qw(timelocal);
 use lib 'lib', 'tests/lib';
+use AudioManager::Config ();
 use AudioManagerTestEnv qw(reset_env add_sonos add_bridge add_tts define_manager command_log log_messages timers run_next_timer advance_time reading_value set_reading);
 
 my $loaded = do './FHEM/90_AudioManager.pm';
@@ -143,7 +144,7 @@ subtest 'Attributparser akzeptieren partielle Defaults und lehnen Fehler ab' => 
 	is(main::AudioManager_Attr('set', 'Audio', 'healthRecoveryCooldown', '30.5'), undef, 'Recovery-Cooldown akzeptiert Sekundenbruchteile');
 	is(main::AudioManager_Attr('set', 'Audio', 'healthProbeInterval', '30.5'), undef, 'Probeintervall akzeptiert Sekundenbruchteile');
 	like(main::AudioManager_Attr('set', 'Audio', 'healthProbeInterval', '0'), qr/positive/, 'Probeintervall muss positiv bleiben');
-	my ($availability, $availability_error) = main::AudioManager_parse_backend_availability(
+	my ($availability, $availability_error) = AudioManager::Config::parse_backend_availability(
 		'sonos=Sonos.Bridge,music=Music.Bridge:serviceState',
 	);
 	is($availability_error, undef, 'mehrere Praefixe sind gueltig');
@@ -165,22 +166,22 @@ subtest 'volumeLimits klemmt Requests und Alarmminimum zeitabhaengig' => sub {
 	reset_env();
 	add_sonos('Sonos.A', 'uuid-a');
 	my ($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
-	my ($limits, $parse_error) = main::AudioManager_parse_volume_limits(
+	my ($limits, $parse_error) = AudioManager::Config::parse_volume_limits(
 		'stream:10-40,alarm:8-20:30-80,20-8:30-50',
 	);
 	is($parse_error, undef, 'statische Grenze und zwei Alarmfenster werden geparst');
 	is(
-		main::AudioManager_volume_limit_at($limits, 'stream', 3 * 60),
+		AudioManager::Config::volume_limit_at($limits, 'stream', 3 * 60),
 		{ minimum => 10, maximum => 40, all_day => 1 },
 		'statische Streamgrenze gilt ganztags',
 	);
 	is(
-		main::AudioManager_volume_limit_at($limits, 'alarm', 19 * 60 + 59),
+		AudioManager::Config::volume_limit_at($limits, 'alarm', 19 * 60 + 59),
 		{ minimum => 30, maximum => 80, all_day => 0, start => 8 * 60, end => 20 * 60 },
 		'Tagesfenster gilt bis zum exklusiven Ende',
 	);
 	is(
-		main::AudioManager_volume_limit_at($limits, 'alarm', 21 * 60),
+		AudioManager::Config::volume_limit_at($limits, 'alarm', 21 * 60),
 		{ minimum => 30, maximum => 50, all_day => 0, start => 20 * 60, end => 8 * 60 },
 		'Nachtfenster reicht ueber Mitternacht',
 	);
@@ -227,16 +228,16 @@ subtest 'quietHours parst mehrere Fenster und blockiert nur konfigurierte Audioa
 	add_tts('SonosTTS');
 	$main::attr{Audio}{ttsDevice} = 'SonosTTS';
 	my ($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
-	my ($quiet_hours, $parse_error) = main::AudioManager_parse_quiet_hours('speak=20-7,12-14,queue=10-12');
+	my ($quiet_hours, $parse_error) = AudioManager::Config::parse_quiet_hours('speak=20-7,12-14,queue=10-12');
 	is($parse_error, undef, 'Nacht- und Mittagsfenster sind gueltig');
-	ok(main::AudioManager_quiet_hours_match($quiet_hours, 'speak', 20 * 60), 'Start der Nachtruhe ist gesperrt');
-	ok(main::AudioManager_quiet_hours_match($quiet_hours, 'speak', 6 * 60 + 59), 'Minute vor Ende der Nachtruhe ist gesperrt');
-	ok(!main::AudioManager_quiet_hours_match($quiet_hours, 'speak', 7 * 60), 'Ende der Nachtruhe ist wieder freigegeben');
-	ok(main::AudioManager_quiet_hours_match($quiet_hours, 'speak', 12 * 60), 'Start der Mittagsruhe ist gesperrt');
-	ok(!main::AudioManager_quiet_hours_match($quiet_hours, 'speak', 14 * 60), 'Ende der Mittagsruhe ist wieder freigegeben');
-	ok(main::AudioManager_quiet_hours_match($quiet_hours, 'queue', 10 * 60), 'zweite Audioart wird mit Komma begonnen');
-	ok(!main::AudioManager_quiet_hours_match($quiet_hours, 'queue', 12 * 60), 'Ende der Queue-Ruhe ist wieder freigegeben');
-	ok(!main::AudioManager_quiet_hours_match($quiet_hours, 'alarm', 21 * 60), 'nicht konfigurierter Alarm bleibt freigegeben');
+	ok(AudioManager::Config::quiet_hours_match($quiet_hours, 'speak', 20 * 60), 'Start der Nachtruhe ist gesperrt');
+	ok(AudioManager::Config::quiet_hours_match($quiet_hours, 'speak', 6 * 60 + 59), 'Minute vor Ende der Nachtruhe ist gesperrt');
+	ok(!AudioManager::Config::quiet_hours_match($quiet_hours, 'speak', 7 * 60), 'Ende der Nachtruhe ist wieder freigegeben');
+	ok(AudioManager::Config::quiet_hours_match($quiet_hours, 'speak', 12 * 60), 'Start der Mittagsruhe ist gesperrt');
+	ok(!AudioManager::Config::quiet_hours_match($quiet_hours, 'speak', 14 * 60), 'Ende der Mittagsruhe ist wieder freigegeben');
+	ok(AudioManager::Config::quiet_hours_match($quiet_hours, 'queue', 10 * 60), 'zweite Audioart wird mit Komma begonnen');
+	ok(!AudioManager::Config::quiet_hours_match($quiet_hours, 'queue', 12 * 60), 'Ende der Queue-Ruhe ist wieder freigegeben');
+	ok(!AudioManager::Config::quiet_hours_match($quiet_hours, 'alarm', 21 * 60), 'nicht konfigurierter Alarm bleibt freigegeben');
 	like(main::AudioManager_Attr('set', 'Audio', 'quietHours', 'speak=25-7'), qr/Ungueltiges Ruhefenster/, 'ungueltige Stunde wird abgelehnt');
 	like(main::AudioManager_Attr('set', 'Audio', 'quietHours', 'unknown=20-7'), qr/Ungueltiger Ruhezeiteneintrag/, 'unbekannte Audioart wird abgelehnt');
 	like(main::AudioManager_Attr('set', 'Audio', 'quietHours', 'speak=7-7'), qr/keine Dauer/, 'leeres Zeitfenster wird abgelehnt');
@@ -509,7 +510,7 @@ subtest 'kurze TTS endet per MP3-Dauer und setzt den eigenen Favoriten fort' => 
 	my ($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
 	is(main::AudioManager_Set($hash, 'Audio', 'stream', 'Antenne.Muenster'), undef, 'Radio startet');
 	my $favorite_starts = grep { $_ eq 'set Sonos.A playFav Antenne.Muenster' } @{ command_log() };
-	set_reading('Sonos.A', 'currentTrack_TrackUri', 'http://fhem/vogel/alt.mp3');
+	set_reading('Sonos.A', 'currentTrack_trackUri', 'http://fhem/vogel/alt.mp3');
 	is(main::AudioManager_Set($hash, 'Audio', 'speak', 'Kurze Ansage'), undef, 'Ansage wird erzeugt');
 	set_reading('SonosTTS', 'httpName', 'http://fhem/speech-short.mp3');
 	set_reading('SonosTTS', 'lastFilename', 'speech-short.mp3');
@@ -522,7 +523,7 @@ subtest 'kurze TTS endet per MP3-Dauer und setzt den eigenen Favoriten fort' => 
 		defined($speak->{runtime}{backends}{sonos2mqtt}{playback_started_at}),
 		'Quellenbefehl setzt den Zeitanker fuer die Startfrist',
 	);
-	set_reading('Sonos.A', 'currentTrack_TrackUri', 'http://fhem/vogel/alt.mp3');
+	set_reading('Sonos.A', 'currentTrack_trackUri', 'http://fhem/vogel/alt.mp3');
 	set_reading('Sonos.A', 'transportState', 'STOPPED');
 	advance_time(3);
 
@@ -535,7 +536,7 @@ subtest 'kurze TTS endet per MP3-Dauer und setzt den eigenen Favoriten fort' => 
 	);
 
 	# Erst die angeforderte URI mit aktivem Transport startet die fachliche MP3-Dauer.
-	set_reading('Sonos.A', 'currentTrack_TrackUri', 'http://fhem/speech-short.mp3');
+	set_reading('Sonos.A', 'currentTrack_trackUri', 'http://fhem/speech-short.mp3');
 	set_reading('Sonos.A', 'transportState', 'PLAYING');
 	main::AudioManager_Worker($hash);
 	is($speak->{state}, 'active', 'Startbestaetigung beendet den Clip nicht vorzeitig');
@@ -992,7 +993,7 @@ subtest 'periodische ZoneInfo-Probes reparieren ausgefallene Player ohne externe
 	my @offline_logs = grep { $_->{message} =~ /Player offline: Sonos\.B/ } @{ log_messages() };
 	is(scalar(@offline_logs), 1, 'der endgueltige Offlinezustand wird genau einmal geloggt');
 	is($offline_logs[0]{level}, 2, 'der Offlinezustand verwendet Log-Level 2');
-	main::AudioManager_update_health($hash);
+	AudioManager::Module::Status::update_health($hash, \&AudioManager::Module::FHEM::log);
 	is(
 		scalar(grep { $_->{message} =~ /Player offline: Sonos\.B/ } @{ log_messages() }),
 		1,

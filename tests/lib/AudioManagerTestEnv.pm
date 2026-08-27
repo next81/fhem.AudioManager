@@ -38,7 +38,7 @@ sub add_sonos {
 			uuid => { VAL => $uuid },
 			coordinatorUuid => { VAL => $coordinator_uuid },
 			transportState => { VAL => $readings{transportState} // 'STOPPED' },
-			currentTrack_TrackUri => { VAL => $readings{uri} // '' },
+			currentTrack_trackUri => { VAL => $readings{uri} // '' },
 			currentTrack_title => { VAL => $readings{title} // '' },
 			currentTrack_Title => { VAL => $readings{legacyTitle} // '' },
 			currentTrack_artist => { VAL => $readings{artist} // '' },
@@ -258,7 +258,7 @@ sub CommandSet($$) {
 		} elsif ($raw_command eq 'stop') {
 			$defs{$device}{READINGS}{transportState}{VAL} = 'STOPPED';
 		} elsif ($raw_command eq 'setavtransporturi') {
-			$defs{$device}{READINGS}{currentTrack_TrackUri}{VAL} = $input;
+			$defs{$device}{READINGS}{currentTrack_trackUri}{VAL} = $input;
 		} elsif ($raw_command eq 'switchtoqueue') {
 			$defs{$device}{READINGS}{Input}{VAL} = 'Queue';
 		} elsif ($raw_command eq 'playmode') {
@@ -291,10 +291,10 @@ sub CommandSet($$) {
 	} elsif ($command eq 'stop') {
 		$defs{$device}{READINGS}{transportState}{VAL} = 'STOPPED';
 	} elsif ($command eq 'playUri') {
-		$defs{$device}{READINGS}{currentTrack_TrackUri}{VAL} = $value;
+		$defs{$device}{READINGS}{currentTrack_trackUri}{VAL} = $value;
 		$defs{$device}{READINGS}{transportState}{VAL} = 'PLAYING';
 	} elsif ($command eq 'playFav') {
-		$defs{$device}{READINGS}{currentTrack_TrackUri}{VAL} = "favorite:$value";
+		$defs{$device}{READINGS}{currentTrack_trackUri}{VAL} = "favorite:$value";
 		$defs{$device}{READINGS}{Input}{VAL} = 'Radio';
 		$defs{$device}{READINGS}{transportState}{VAL} = 'PLAYING';
 	} elsif ($command eq 'input') {

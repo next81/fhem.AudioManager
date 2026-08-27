@@ -7,7 +7,9 @@ use AudioManager::Backend;
 use AudioManager::Backend::Sonos2mqtt;
 use AudioManager::FHEMGateway;
 
-my (%devices, %attributes, %reading_timestamps, @commands, @publishes, $now);
+# Merkt Attributzugriffe, damit Topologiescans keine unvollstaendigen FHEM-Hashes beruehren.
+my (%devices, %attributes, %reading_timestamps, @attribute_reads, @commands, @publishes, $now);
+my ($defer_pause_reading, $defer_stop_reading);
 
 # Loest den von sonos2mqtt verwendeten sichtbaren Namen zum FHEM-Testdevice auf.
 sub device_by_sonos_name {
@@ -26,7 +28,10 @@ sub gateway {
 	return AudioManager::FHEMGateway->new(
 		device => sub { return $devices{ $_[0] } },
 		device_names => sub { return [ sort keys %devices ] },
-		attr_value => sub { return $attributes{ $_[0] }{ $_[1] } // $_[2] },
+		attr_value => sub {
+			push @attribute_reads, [ @_[0, 1] ];
+			return $attributes{ $_[0] }{ $_[1] } // $_[2];
+		},
 		reading_value => sub { return $devices{ $_[0] }{READINGS}{ $_[1] } // $_[2] },
 		reading_timestamp => sub { return $reading_timestamps{ $_[0] }{ $_[1] } // $_[2] },
 		now => sub { return $now },
@@ -57,7 +62,7 @@ sub gateway {
 				} elsif ($raw_command eq 'mute' || $raw_command eq 'unmute') {
 					$devices{$device}{READINGS}{mute} = $raw_command eq 'mute' ? 'true' : 'false';
 				} elsif ($raw_command eq 'setavtransporturi') {
-					$devices{$device}{READINGS}{currentTrack_TrackUri} = $input;
+					$devices{$device}{READINGS}{currentTrack_trackUri} = $input;
 				} elsif ($raw_command eq 'switchtoqueue') {
 					$devices{$device}{READINGS}{Input} = 'Queue';
 				} elsif ($raw_command eq 'playmode') {
@@ -67,9 +72,13 @@ sub gateway {
 				} elsif ($raw_command eq 'play') {
 					$devices{$device}{READINGS}{transportState} = 'PLAYING';
 				} elsif ($raw_command eq 'pause') {
-					$devices{$device}{READINGS}{transportState} = 'PAUSED_PLAYBACK';
+					# Verzoegerte Readings bilden die asynchrone Sonos-Bestaetigung nach.
+					$devices{$device}{READINGS}{transportState} = 'PAUSED_PLAYBACK'
+						if !$defer_pause_reading;
 				} elsif ($raw_command eq 'stop') {
-					$devices{$device}{READINGS}{transportState} = 'STOPPED';
+					# Auch ein Stop darf fuer Reihenfolgetests spaeter bestaetigt werden.
+					$devices{$device}{READINGS}{transportState} = 'STOPPED'
+						if !$defer_stop_reading;
 				}
 
 				return undef;
@@ -89,16 +98,20 @@ sub gateway {
 				$next = 0 if $next < 0;
 				$devices{$device}{READINGS}{volume} = $next;
 			} elsif ($command eq 'playUri') {
-				$devices{$device}{READINGS}{currentTrack_TrackUri} = $value;
+				$devices{$device}{READINGS}{currentTrack_trackUri} = $value;
 				$devices{$device}{READINGS}{transportState} = 'PLAYING';
 			} elsif ($command eq 'input') {
 				$devices{$device}{READINGS}{Input} = $value;
 			} elsif ($command eq 'play') {
 				$devices{$device}{READINGS}{transportState} = 'PLAYING';
 			} elsif ($command eq 'pause') {
-				$devices{$device}{READINGS}{transportState} = 'PAUSED_PLAYBACK';
+				# Verzoegerte Readings bilden die asynchrone Sonos-Bestaetigung nach.
+				$devices{$device}{READINGS}{transportState} = 'PAUSED_PLAYBACK'
+					if !$defer_pause_reading;
 			} elsif ($command eq 'stop') {
-				$devices{$device}{READINGS}{transportState} = 'STOPPED';
+				# Auch ein Stop darf fuer Reihenfolgetests spaeter bestaetigt werden.
+				$devices{$device}{READINGS}{transportState} = 'STOPPED'
+					if !$defer_stop_reading;
 			}
 			return undef;
 		},
@@ -110,9 +123,12 @@ sub reset_backend_env {
 	%devices = ();
 	%attributes = ();
 	%reading_timestamps = ();
+	@attribute_reads = ();
 	@commands = ();
 	@publishes = ();
 	$now = 10_000;
+	$defer_pause_reading = 0;
+	$defer_stop_reading = 0;
 }
 
 # Legt einen Speaker mit flachen Readingwerten fuer das injizierte Gateway an.
@@ -127,7 +143,7 @@ sub speaker {
 			uuid => $uuid,
 			coordinatorUuid => $coordinator || $uuid,
 			transportState => $extra{transportState} || 'STOPPED',
-			currentTrack_TrackUri => $extra{uri} || '',
+			currentTrack_trackUri => $extra{uri} || '',
 			currentTrack_title => $extra{title} || '',
 			currentTrack_Title => $extra{legacyTitle} || '',
 			currentTrack_artist => $extra{artist} || '',
@@ -179,6 +195,25 @@ subtest 'Topologie verwendet UUIDs und Zielgruppen bleiben verwaltet' => sub {
 	is($error, undef, 'Gruppenziel wird aufgeloest');
 	is($targets, [qw(Sonos.A Sonos.B)], 'nur verwaltete Gruppenmitglieder werden geliefert');
 	like(($backend->resolve_target('player:Sonos.C'))[1], qr/nicht verwaltet/, 'fremder Speaker bleibt ausserhalb der Grenze');
+};
+
+subtest 'Topologiescan ignoriert unvollstaendige und fremde FHEM-Devices' => sub {
+	reset_backend_env();
+	speaker('Sonos.A', 'uuid-a');
+	$devices{'Unvollstaendig'} = { NAME => 'Unvollstaendig', READINGS => {} };
+	$devices{'FremderTyp'} = { NAME => 'FremderTyp', TYPE => 'dummy', READINGS => {} };
+	$attributes{'FremderTyp'}{model} = 'sonos2mqtt_speaker';
+	my $backend = AudioManager::Backend->create(
+		'sonos2mqtt', id => 'home', players => ['Sonos.A'], gateway => gateway(),
+	);
+	@attribute_reads = ();
+	my $topology = $backend->topology;
+	is([ sort keys %{ $topology->{players} } ], ['Sonos.A'], 'nur MQTT2-Speaker gelangen in die Topologie');
+	is(
+		\@attribute_reads,
+		[ [ 'Sonos.A', 'model' ] ],
+		'der Modellzugriff ueberspringt unvollstaendige und fremde Devices',
+	);
 };
 
 subtest 'bestehende Gruppe spielt immer ueber ihren wirklichen Coordinator' => sub {
@@ -424,6 +459,88 @@ subtest 'Gruppenbeitritt verwendet den sichtbaren Sonos-Namen' => sub {
 	);
 };
 
+subtest 'Ansagepegelsprung wartet auf bestaetigte Pause der vorherigen Quelle' => sub {
+	reset_backend_env();
+	speaker(
+		'Sonos.A', 'uuid-a', undef,
+		transportState => 'PLAYING', uri => 'favorite:Radio', volume => 12,
+	);
+	my $backend = AudioManager::Backend->create(
+		'sonos2mqtt', id => 'home', players => ['Sonos.A'], gateway => gateway(),
+	);
+	my $request = {
+		type => 'speak',
+		payload => {
+			uri => 'http://fhem/speech.mp3', volume => 40,
+			volume_policy => 'fixed', target_mode => 'existing_groups',
+		},
+		runtime => {},
+	};
+	$defer_pause_reading = 1;
+	is($backend->start($request, ['Sonos.A']), undef, 'Ansage wartet auf asynchrone Pause');
+	is(
+		$request->{runtime}{backends}{home}{phase},
+		'start_quieting',
+		'der Backendautomat merkt die ausstehende Pause',
+	);
+	is(\@commands, ['Sonos.A pause'], 'vor der Pausebestaetigung wird nur pause gesendet');
+	is($devices{'Sonos.A'}{READINGS}{volume}, 12, 'der laufende Stream behaelt seinen Pegel');
+
+	# Erst das Sonos-Reading gibt Pegelwechsel und Sprachquelle gemeinsam frei.
+	$devices{'Sonos.A'}{READINGS}{transportState} = 'PAUSED_PLAYBACK';
+	$defer_pause_reading = 0;
+	is($backend->progress($request), undef, 'Pausebestaetigung setzt den Start fort');
+	is(
+		\@commands,
+		[
+			'Sonos.A pause',
+			'Sonos.A mute false',
+			'Sonos.A volume 40',
+			'Sonos.A playUri http://fhem/speech.mp3',
+		],
+		'Ansagepegel folgt erst auf die bestaetigte Stille',
+	);
+};
+
+subtest 'Resumepegelsprung wartet auf bestaetigtes Ende der Ansage' => sub {
+	reset_backend_env();
+	speaker(
+		'Sonos.A', 'uuid-a', undef,
+		transportState => 'PLAYING', uri => 'favorite:Radio', volume => 15,
+	);
+	my $backend = AudioManager::Backend->create(
+		'sonos2mqtt', id => 'home', players => ['Sonos.A'], gateway => gateway(),
+	);
+	my $request = {
+		type => 'stream',
+		payload => { favorite => 'Radio', volume => 15, volume_policy => 'fixed' },
+		runtime => { backends => { home => {
+			phase => 'suspended',
+			resume_snapshot => $backend->snapshot(['Sonos.A']),
+		} } },
+	};
+	$devices{'Sonos.A'}{READINGS}{transportState} = 'PLAYING';
+	$devices{'Sonos.A'}{READINGS}{currentTrack_trackUri} = 'http://fhem/speech.mp3';
+	$devices{'Sonos.A'}{READINGS}{volume} = 40;
+	$defer_stop_reading = 1;
+	is($backend->resume($request), undef, 'Resume wartet auf asynchrones Ansageende');
+	is(
+		$request->{runtime}{backends}{home}{phase},
+		'resume_quieting',
+		'der Backendautomat merkt das ausstehende Ende',
+	);
+	is(\@commands, ['Sonos.A stop'], 'vor der Stopbestaetigung wird kein alter Pegel restauriert');
+	is($devices{'Sonos.A'}{READINGS}{volume}, 40, 'die laufende Ansage behaelt bis zum Ende ihren Pegel');
+
+	# Nach STOPPED duerfen der alte Pegel und der Stream gemeinsam zurueckkehren.
+	$devices{'Sonos.A'}{READINGS}{transportState} = 'STOPPED';
+	$defer_stop_reading = 0;
+	is($backend->progress($request), undef, 'Stopbestaetigung setzt Resume fort');
+	ok(grep($_ eq 'Sonos.A volume 15', @commands), 'der alte Pegel folgt auf STOPPED');
+	ok(grep($_ eq 'Sonos.A playFav Radio', @commands), 'der Stream startet erst nach STOPPED neu');
+	is($request->{runtime}{backends}{home}{phase}, 'restored', 'Resume ist danach abgeschlossen');
+};
+
 subtest 'Startbestaetigung toleriert Sonos-URI-Umschreibung ohne Fremdquelle zu akzeptieren' => sub {
 	reset_backend_env();
 	speaker('Sonos.A', 'uuid-a', undef, transportState => 'STOPPED');
@@ -436,7 +553,7 @@ subtest 'Startbestaetigung toleriert Sonos-URI-Umschreibung ohne Fremdquelle zu 
 		runtime => {},
 	};
 	is($backend->start($request, ['Sonos.A']), undef, 'Sprachclip wird gestartet');
-	$devices{'Sonos.A'}{READINGS}{currentTrack_TrackUri} = 'x-rincon-mp3radio://speech';
+	$devices{'Sonos.A'}{READINGS}{currentTrack_trackUri} = 'x-rincon-mp3radio://speech';
 	is($backend->is_playing($request, ['Sonos.A']), 1, 'umgeschriebene Quelle bestaetigt den Start');
 	is(
 		$request->{runtime}{backends}{home}{playback_confirmation},
@@ -456,7 +573,7 @@ subtest 'Startbestaetigung toleriert Sonos-URI-Umschreibung ohne Fremdquelle zu 
 		runtime => {},
 	};
 	is($backend->start($request, ['Sonos.B']), undef, 'Befehl wird an bereits spielenden Player gesendet');
-	$devices{'Sonos.B'}{READINGS}{currentTrack_TrackUri} = 'favorite:Radio';
+	$devices{'Sonos.B'}{READINGS}{currentTrack_trackUri} = 'favorite:Radio';
 	is($backend->is_playing($request, ['Sonos.B']), 0, 'unveraenderte Fremdquelle gilt nicht als Start');
 };
 
@@ -563,10 +680,10 @@ subtest 'Ansage unterbricht REPEAT_ALL-Queue einmalig und setzt sie bestaetigt f
 	ok(grep($_ eq 'Sonos.A input Queue', @commands), 'Queue-Eingang wird erneut angefordert');
 	ok(!grep($_ eq 'Sonos.A play', @commands), 'Play wird nicht im selben Zyklus zu frueh gesendet');
 	$devices{'Sonos.A'}{READINGS}{Input} = 'Radio';
-	$devices{'Sonos.A'}{READINGS}{currentTrack_TrackUri} = 'http://fhem/speech/test.mp3';
+	$devices{'Sonos.A'}{READINGS}{currentTrack_trackUri} = 'http://fhem/speech/test.mp3';
 	is($backend->progress($queue), undef, 'veraltete TTS-Quelle bestaetigt den Queue-Wechsel noch nicht');
 	ok(!grep($_ eq 'Sonos.A play', @commands), 'Queue bleibt bis zur Quellenbestaetigung pausiert');
-	$devices{'Sonos.A'}{READINGS}{currentTrack_TrackUri} = 'http://fhem/vogel/a.mp3';
+	$devices{'Sonos.A'}{READINGS}{currentTrack_trackUri} = 'http://fhem/vogel/a.mp3';
 	is($backend->progress($queue), undef, 'Vogel-URI bestaetigt die wiederhergestellte Queue');
 	ok(grep($_ eq 'Sonos.A play', @commands), 'Queue startet erst nach der Bestaetigung wieder');
 	is($devices{'Sonos.A'}{READINGS}{playmode}, 'REPEAT_ALL', 'Vogel-Queue behaelt ihren Wiederholungsmodus');
@@ -627,7 +744,7 @@ subtest 'Queue-Bestaetigung verwendet Request-URI trotz veraltetem Radio-Input' 
 	};
 	is($backend->start($request, ['Sonos.A']), undef, 'Queue-Wechsel wird angefordert');
 	$devices{'Sonos.A'}{READINGS}{Input} = 'Radio';
-	$devices{'Sonos.A'}{READINGS}{currentTrack_TrackUri} = 'http://fhem/vogel/a.mp3';
+	$devices{'Sonos.A'}{READINGS}{currentTrack_trackUri} = 'http://fhem/vogel/a.mp3';
 	is($backend->progress($request), undef, 'URI-Wechsel bestaetigt die verwaltete Queue');
 	ok(grep($_ eq 'Sonos.A play', @commands), 'Queue startet trotz unzutreffendem Input-Reading');
 	is(
@@ -681,7 +798,7 @@ subtest 'Stream-Resume verwendet Favorit statt veraltetem Trackreading' => sub {
 		runtime => {},
 	};
 	is($backend->start($request, ['Sonos.A']), undef, 'Favoritenstream wird gestartet');
-	$devices{'Sonos.A'}{READINGS}{currentTrack_TrackUri} = 'http://fhem/vogel/alt.mp3';
+	$devices{'Sonos.A'}{READINGS}{currentTrack_trackUri} = 'http://fhem/vogel/alt.mp3';
 	is($backend->suspend($request, ['Sonos.A']), undef, 'verspaetetes Vogelreading landet im Suspend-Snapshot');
 	@commands = ();
 	is($backend->resume($request), undef, 'Stream wird aus seinem fachlichen Request fortgesetzt');
@@ -716,7 +833,7 @@ subtest 'Stream-Resume verwendet Request-URI statt veraltetem Trackreading' => s
 		runtime => {},
 	};
 	is($backend->start($request, ['Sonos.A']), undef, 'URI-Stream wird gestartet');
-	$devices{'Sonos.A'}{READINGS}{currentTrack_TrackUri} = 'http://fhem/vogel/alt.mp3';
+	$devices{'Sonos.A'}{READINGS}{currentTrack_trackUri} = 'http://fhem/vogel/alt.mp3';
 	is($backend->suspend($request, ['Sonos.A']), undef, 'verspaetetes Reading wird im Snapshot sichtbar');
 	@commands = ();
 	is($backend->resume($request), undef, 'URI-Stream wird aus seinem Request fortgesetzt');

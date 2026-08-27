@@ -371,7 +371,7 @@ subtest 'kurze TTS endet per MP3-Dauer und setzt den eigenen Favoriten fort' => 
 	my ($hash) = define_manager('Audio', 'sonos2mqtt=Sonos.A');
 	is(main::AudioManager_Set($hash, 'Audio', 'stream', 'Antenne.Muenster'), undef, 'Radio startet');
 	my $favorite_starts = grep { $_ eq 'set Sonos.A playFav Antenne.Muenster' } @{ command_log() };
-	set_reading('Sonos.A', 'currentTrack_TrackUri', 'http://fhem/vogel/alt.mp3');
+	set_reading('Sonos.A', 'currentTrack_trackUri', 'http://fhem/vogel/alt.mp3');
 	is(main::AudioManager_Set($hash, 'Audio', 'speak', 'Kurze Ansage'), undef, 'Ansage wird erzeugt');
 	set_reading('SonosTTS', 'httpName', 'http://fhem/speech-short.mp3');
 	set_reading('SonosTTS', 'lastFilename', 'speech-short.mp3');
@@ -384,7 +384,7 @@ subtest 'kurze TTS endet per MP3-Dauer und setzt den eigenen Favoriten fort' => 
 		defined($speak->{runtime}{backends}{sonos2mqtt}{playback_started_at}),
 		'Quellenbefehl setzt den Zeitanker fuer die Startfrist',
 	);
-	set_reading('Sonos.A', 'currentTrack_TrackUri', 'http://fhem/vogel/alt.mp3');
+	set_reading('Sonos.A', 'currentTrack_trackUri', 'http://fhem/vogel/alt.mp3');
 	set_reading('Sonos.A', 'transportState', 'STOPPED');
 	advance_time(3);
 
@@ -397,7 +397,7 @@ subtest 'kurze TTS endet per MP3-Dauer und setzt den eigenen Favoriten fort' => 
 	);
 
 	# Erst die angeforderte URI mit aktivem Transport startet die fachliche MP3-Dauer.
-	set_reading('Sonos.A', 'currentTrack_TrackUri', 'http://fhem/speech-short.mp3');
+	set_reading('Sonos.A', 'currentTrack_trackUri', 'http://fhem/speech-short.mp3');
 	set_reading('Sonos.A', 'transportState', 'PLAYING');
 	main::AudioManager_Worker($hash);
 	is($speak->{state}, 'active', 'Startbestaetigung beendet den Clip nicht vorzeitig');
